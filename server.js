@@ -28,7 +28,7 @@ const connection = mysql.createConnection({
   port: 4000,
   user: "root",
   password: "1234",
-  database: "cdac",
+  database: "cdac3",
 });
 
 // Connect to the database
@@ -94,6 +94,10 @@ const createCertSummaryList = (certInfos) => {
       state: cert.state || "Unknown State", // Assuming cert.state exists
       certType: cert.certType || "NA", // Static value as specified
       constraints: cert.constraints,
+      subjectType: cert.subjectType,
+      Email: cert.email,
+      X509Cert: cert.x509Cert,
+      // validityPeriod: cert.validityPeriod,
     };
 
     summaryList.push(summary);
@@ -184,66 +188,74 @@ async function executeQuery(query, params = []) {
   });
 }
 
-async function validateCertificates(summaryList) {
-  const invalidCerts = [];
-
-  for (const cert of summaryList) {
-    const { SerialNumber, IssuerCert_SrNo, IssuerCommonName } = cert;
-
-    const query = `
-      SELECT * FROM cert
-      WHERE SerialNumber = ?
-        AND IssuerCert_SrNo = ?
-        AND IssuerCommonName = ?
+async function checkPreCertificateInDatabase(certificate) {
+  try {
+    // Query to check if a certificate with the given primary keys already exists
+    const checkQuery = `
+      SELECT COUNT(*) AS count FROM precert 
+      WHERE SerialNumber = ? AND IssuerName = ? AND IssuerSlNo = ?
     `;
 
-    try {
-      const results = await executeQuery(query, [
-        SerialNumber,
-        IssuerCert_SrNo,
-        IssuerCommonName,
-      ]);
+    // Values for the check query
+    const checkValues = [
+      certificate.SerialNumber, // SerialNumber
+      certificate.IssuerName, // IssuerName
+      certificate.IssuerSlNo, // IssuerSlNo
+    ];
 
-      if (results.length === 0) {
-        invalidCerts.push(cert);
-      }
-    } catch (error) {
-      console.error("Error validating certificate:", error);
+    // Execute the check query
+    const checkResult = await executeQuery(checkQuery, checkValues);
+
+    // If the certificate already exists, return a message or handle as needed
+    if (checkResult[0].count === 0) {
+      throw new Error(
+        "Pre-Certificate doesn't exist in the database for this certificate"
+      );
     }
+    console.log("Pre-Certificate Exists in the database");
+  } catch (err) {
+    console.error(err);
+    throw new Error(`Error Occurred while checking database: ${err}`);
   }
-
-  return invalidCerts;
 }
-
-async function checkRevokedCertificates(summaryList) {
-  const revokedCerts = [];
-
-  for (const cert of summaryList) {
-    const { SerialNumber, IssuerCert_SrNo, IssuerCommonName } = cert;
-
+async function insertCertificateInDatabase(certificate) {
+  try {
+    // SQL query to insert a new certificate record
     const query = `
-      SELECT * FROM revocation_data
-      WHERE SerialNumber = ?
-        AND IssuerCert_SrNo = ?
-        AND IssuerCommonName = ?
+      INSERT INTO cert (
+        SerialNumber, IssueDate, ExpiryDate, CertType, IssuerSlNo, IssuerName, Country, Organization, State, SubjectName, Email, City, SubjectType, Fp_512, RawCertificate, CAname, ValidityPeriod
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `;
 
-    try {
-      const results = await executeQuery(query, [
-        SerialNumber,
-        IssuerCert_SrNo,
-        IssuerCommonName,
-      ]);
+    // Extract the relevant fields from certificate
+    const values = [
+      certificate.SerialNumber, // SerialNumber
+      certificate.IssuedDate, // IssueDate
+      certificate.ExpiryDate, // ExpiryDate
+      "Signing",
+      // certificate.certType, // CertType
+      certificate.IssuerSlNo || "Unknown Issuer Serial", // IssuerSlNo
+      certificate.IssuerName || "Unknown Issuer", // IssuerName
+      certificate.Country || "Unknown Country", // Country
+      certificate.Organization || "Unknown Org", // Organization
+      certificate.state || "Unknown State", // State
+      certificate.SubjectName, // SubjectName
+      certificate.Email, // Email
+      certificate.City || "Unknown City", // City
+      certificate.subjectType, // SubjectType
+      certificate.hash, // Fp_512 (using hash)
+      certificate.X509Cert || "Unknown Certificate", // RawCertificate (using X509Cert)
+      certificate.CAName || "Unknown CA", // CAname
+      certificate.validityPeriod, // ValidityPeriod
+    ];
 
-      if (results.length > 0) {
-        revokedCerts.push(results[0]);
-      }
-    } catch (error) {
-      console.error("Error checking revocation data:", error);
-    }
+    // Use the executeQuery function to run the query
+    const result = await executeQuery(query, values);
+    console.log("Certificate successfully stored in the database:", result);
+  } catch (err) {
+    console.error(err);
+    throw new Error(`Error storing Certificate in the database: ${err}`);
   }
-
-  return revokedCerts;
 }
 
 // const isValidX509 = (data) => {
@@ -254,6 +266,20 @@ async function checkRevokedCertificates(summaryList) {
 //     return false;
 //   }
 // };
+
+const calculateValidityPeriod = function (issuedDate, expiryDate) {
+  const startDate = new Date(issuedDate);
+  const endDate = new Date(expiryDate);
+  let years = endDate.getFullYear() - startDate.getFullYear();
+  const months = endDate.getMonth() - startDate.getMonth();
+  const days = endDate.getDate() - startDate.getDate();
+
+  // Adjust the year count based on month and day
+  if (months < 0 || (months === 0 && days < 0)) {
+    years -= 1;
+  }
+  return years;
+};
 
 app.post("/process-certificate", async (req, res) => {
   try {
@@ -335,19 +361,65 @@ async function processCertificate(initialCertFile, res) {
     if (expiredCerts.length > 0) {
       deleteAllFilesInDirectory(baseDir);
       return res.status(400).json({
+        status: "Fail",
         message:
           "Certificate chain processed but some certificates are expired or invalid.",
-        certSummaryList,
+        // certSummaryList,
         expiredCerts,
       });
     }
+    const lastCert = certSummaryList[certSummaryList.length - 1];
+    const preCertData = generatePreCertData(certData, "pem");
+    lastCert.hash = preCertData.sha256Hash;
+    lastCert.validityPeriod = calculateValidityPeriod(
+      lastCert.IssuedDate,
+      lastCert.ExpiryDate
+    );
+
+    //? Look for pre-certificate in the database
+    await checkPreCertificateInDatabase(lastCert);
+
+    //! BEGIN THE TRANSACTION
+    connection.beginTransaction();
+
+    //? Insert the Certificate into the database
+    await insertCertificateInDatabase(lastCert);
+
+    let args;
+    // Validate from the blockchain
+
+    // const argsToValidateFromBlockchain = {
+    //   SerialNumber: lastCert.SerialNumber, // Assuming this field exists
+    //   IssuserSlNo: lastCert.IssuerSlNo || "Unknown Issuer Serial",
+    //   IssuserName: lastCert.IssuerName || "Unknown Issuer",
+    //   Status: "Final",
+    // };
+
+    // console.log(
+    //?   "Args To Validate from blockchain",
+    //   argsToValidateFromBlockchain
+    // );
+    // args = { ...argsToValidateFromBlockchain };
+
+    // const blockchainResponseForValidation = await verifyCertificateInBlockchain(
+    //   args
+    // );
+    // if (blockchainResponseForValidation.status === "Success") {
+    //   throw new Error(
+    //     `Failed To validate from the blockchain: ${blockchainResponseForValidation.Message}`
+    //   );
+    // }
+
+    // console.log(`Certificate present in the blockchain`);
+
     // Validate and check revoked certificates
-    const invalidCerts = await validateCertificates(certSummaryList);
-    const revokedCerts = await checkRevokedCertificates(certSummaryList);
+    // const invalidCerts = await validateCertificates(certSummaryList);
+    // const revokedCerts = await checkRevokedCertificates(certSummaryList);
 
     // if (invalidCerts.length > 0) {
     //   deleteAllFilesInDirectory(baseDir);
     //   return res.status(400).json({
+    //     status: "Fail",
     //     message: "Some certificates are not issued by us.",
     //     invalidCertificates: invalidCerts,
     //     // initial: initialCertData,
@@ -356,26 +428,15 @@ async function processCertificate(initialCertFile, res) {
 
     // if (revokedCerts.length > 0) {
     //   return res.status(400).json({
+    //     status: "Fail",
     //     message: "Some certificates have been revoked.",
     //     revokedCertificates: revokedCerts,
     //     // initial: initialCertData,
     //   });
     // }
-    const preCertData = generatePreCertData(certData, "pem");
-
-    // Extract the last object from certSummaryList
-    const lastCert = certSummaryList[certSummaryList.length - 1];
-
-    // Use values from preCertData
-    const logId = preCertData.logID;
-    const timestamp = preCertData.timestamp;
-    const hash = preCertData.sha256Hash;
-
-    // console.log(lastCert.IssuedDate);
-    // console.log(lastCert.ExpiryDate);
 
     // Construct the args object dynamically
-    const args = {
+    const argsToStoreInBlockchain = {
       SerialNumber: lastCert.SerialNumber, // Assuming this field exists
       SubjectName: lastCert.SubjectName, // Assuming this field exists
       Organization: lastCert.Organization || "Unknown Org",
@@ -386,37 +447,69 @@ async function processCertificate(initialCertFile, res) {
       CAName: lastCert.CAName || "Unknown CA",
       IssuedDate: lastCert.IssuedDate, // Formatted issued date
       ExpiryDate: lastCert.ExpiryDate, // Formatted expiry date
-      LogID: logId,
-      Timestamp: timestamp,
-      PreCertHash: hash,
-      Status: "PreCert",
+      Status: "Final",
+      x509Cert: lastCert.X509Cert,
+      Hash: lastCert.hash,
       state: lastCert.state || "Unknown State",
       certType: lastCert.certType,
+      Email: lastCert.Email,
+      subjectType: lastCert.subjectType,
+      validityPeriod: lastCert.validityPeriod,
     };
-    console.log(args);
+    console.log("Args To store in blockchain", argsToStoreInBlockchain);
+    args = { ...argsToStoreInBlockchain };
     //Store certificate in the blockchain
-    const blockchainResponse = await storeInBlockchain(args);
+    // const blockchainResponseForStoringData = await storeInBlockchain(args);
 
-    if (blockchainResponse.status !== 200) {
-      throw new Error("Failed to store certificate in the blockchain");
-    }
-
+    // if (blockchainResponseForStoringData.status !== 200) {
+    //   throw new Error("Failed to store certificate in the blockchain");
+    // }
+    //! COMMIT THE TRANSACTION IF EVERYTHING IS SUCCESSFUL
+    connection.commit();
     // Send the success response
     res.status(200).json({
-      message: "Certificate chain processed and verified successfully.",
-      certSummaryList,
-      preCertData,
-      blockchainResponse: blockchainResponse.data,
+      status: "Success",
+      message:
+        "Certificate verified and stored in the blockchain and database successfully.",
+      // certSummaryList,
+      // preCertData,
+      // blockchainResponseForStoringData: blockchainResponseForStoringData.data,
     });
 
     // Cleanup: Delete all downloaded certificates
     deleteAllFilesInDirectory(baseDir);
   } catch (error) {
+    //! ROLLBACK THE TRANSACTION IF ERROR OCCURRED
+    connection.rollback();
     console.error("Error processing certificate:", error.message);
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ status: "Error", error: error.message });
 
     // Cleanup on error
     deleteAllFilesInDirectory(baseDir);
+  }
+}
+
+// Function to verify whether the certificate is present in the blockchain
+async function verifyCertificateInBlockchain(args) {
+  try {
+    const response = await axios.post(
+      "http://10.244.0.197:9080/fabric/v1/invokecc",
+      {
+        fcn: "verifyCert",
+        args,
+      },
+      {
+        headers: {
+          "x-access-token": "{{token}}",
+          apikey: "d1c0d209b2c00e1cee448a703d639b4a0644a07b",
+        },
+      }
+    );
+
+    return response;
+  } catch (error) {
+    console.error("Error processing validation in blockchain:", error.message);
+    throw error;
   }
 }
 // Function to store certificate in the blockchain
@@ -425,7 +518,7 @@ async function storeInBlockchain(args) {
     const response = await axios.post(
       "http://10.244.0.197:9080/fabric/v1/invokecc",
       {
-        fcn: "RecordPreCert",
+        fcn: "RecordCert",
         args,
       },
       {

@@ -21,7 +21,20 @@ function formatDate(dateStr) {
     Date.UTC(year, month - 1, day, hour, minute, second)
   ).toLocaleString("en-US", { timeZone: "UTC" });
 }
+// Get Validity Period
+function getValidityPeriod(validFrom, validTo) {
+  const startDate = formatDate(validFrom);
+  const endDate = formatDate(validTo);
+  const years = endDate.getFullYear() - startDate.getFullYear();
+  const months = endDate.getMonth() - startDate.getMonth();
+  const days = endDate.getDate() - startDate.getDate();
 
+  // If the end date is earlier in the year than the start date, subtract a year
+  if (months < 0 || (months === 0 && days < 0)) {
+    return years - 1;
+  }
+  return years;
+}
 function loadCertificateFromFile(certPath) {
   const fileExtension = path.extname(certPath).toLowerCase();
   const certData = fs.readFileSync(certPath);
@@ -52,23 +65,58 @@ function extractCertInfo(certPem) {
     x.readCertPEM(certPem);
 
     // certInfo.allInfo = x.getInfo();
+    // Adding the x509Cert field to include the raw certificate
+    certInfo.x509Cert = certPem.replace(/\r\n/g, "\n").trim();
     certInfo.commonName = x.getSubjectString().split("/CN=")[1] || "N/A";
     certInfo.issuerName = x.getIssuerString().split("/CN=")[1] || "N/A";
     certInfo.certSerialNumber = x.getSerialNumberHex();
     certInfo.validFrom = formatDate(x.getNotBefore());
     certInfo.validTo = formatDate(x.getNotAfter());
+
     certInfo.organization =
       x.getSubjectString().split("/O=")[1]?.split("/")[0] || "N/A"; // Organization
     certInfo.city =
-      x.getSubjectString().split("/L=")[1]?.split("/")[0] || "N/A"; // City
+      x.getSubjectString().split("/L=")[1]?.split("/")[0] ||
+      x.getSubjectString().split("/localityName=")[1]?.split("/")[0] ||
+      "N/A"; // City
+    certInfo.state =
+      x.getSubjectString().split("/ST=")[1]?.split("/")[0] ||
+      x.getSubjectString().split("/S=")[1]?.split("/")[0] ||
+      "N/A"; // State
     certInfo.country =
       x.getSubjectString().split("/C=")[1]?.split("/")[0] || "N/A"; // Country
     certInfo.certType = x.getExtKeyUsageString();
-    certInfo.constraints = x.getExtBasicConstraints();
-    // For handling OIDs other than RSA, we can extend this part if needed
-    // Example: Extracting public key algorithm
-    // const publicKey = x.getPublicKey();
-    // certInfo.publicKeyAlgorithm = publicKey ? publicKey.alg : "N/A";
+    //? Finding whether the certificate is end-entity or CA
+    let subjectType = "End Entity"; // Path Length (None)
+
+    const basicConstraints = x.getExtBasicConstraints();
+    if (basicConstraints) {
+      if (basicConstraints.cA) {
+        // The certificate is a CA Certificate
+        if (basicConstraints.pathLen === null) subjectType = "CCA";
+        else if (basicConstraints.pathLen === 1) subjectType = "CA";
+        else if (basicConstraints.pathLen === 2) subjectType = "CA"; // SUB-CA
+        else subjectType = "CA";
+      }
+    }
+
+    certInfo.subjectType = subjectType;
+
+    //? finding the email
+    // Get Subject Alternative Name (SAN) values
+    const san = x.getExtSubjectAltName();
+
+    // Initialize email variable
+    let email = "N/A";
+
+    // Check if SAN exists and extract the email if present
+    if (san && san.array) {
+      const emailEntry = san.array.find((entry) => entry.rfc822); // Look for the entry with rfc822 type
+      if (emailEntry) {
+        email = emailEntry.rfc822;
+      }
+    }
+    certInfo.email = email;
   } catch (error) {
     console.error("Error extracting certificate information:", error.message);
     throw error;
